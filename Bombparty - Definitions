@@ -2,7 +2,7 @@
 // @name         BombParty - Définitions
 // @namespace    http://tampermonkey.net/
 // @version      9.4
-// @description  ULTRA RAPIDE - Recherche parallèle + Cache intelligent + Redimensionnable
+// @description  .
 // @author       You
 // @match        https://jklm.fun/*
 // @match        https://*.jklm.fun/*
@@ -15,7 +15,6 @@
 
 (function() {
 	'use strict';
-
 	if (window.defPanelLoaded) {
 		console.log('⚠️ Panneau déjà chargé, arrêt de cette instance');
 		return;
@@ -24,9 +23,7 @@
 
 	const isMainWindow = (window === window.top);
 	console.log(isMainWindow ? '🏠 Contexte principal' : '📦 Contexte iframe');
-
 	const STORAGE_KEY = 'bombparty_definitions_prefs';
-
 	function savePreferences(prefs) {
 		try {
 			localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
@@ -35,7 +32,6 @@
 			console.error('❌ Erreur sauvegarde:', e);
 		}
 	}
-
 	function loadPreferences() {
 		try {
 			const saved = localStorage.getItem(STORAGE_KEY);
