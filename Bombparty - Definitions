@@ -1,0 +1,1236 @@
+// ==UserScript==
+// @name         BombParty - Définitions
+// @namespace    http://tampermonkey.net/
+// @version      9.4
+// @description  ULTRA RAPIDE - Recherche parallèle + Cache intelligent + Redimensionnable
+// @author       You
+// @match        https://jklm.fun/*
+// @match        https://*.jklm.fun/*
+// @grant        GM_xmlhttpRequest
+// @connect      fr.wiktionary.org
+// @connect      api.dictionaryapi.dev
+// @connect      *
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+	'use strict';
+
+	if (window.defPanelLoaded) {
+		console.log('⚠️ Panneau déjà chargé, arrêt de cette instance');
+		return;
+	}
+	window.defPanelLoaded = true;
+
+	const isMainWindow = (window === window.top);
+	console.log(isMainWindow ? '🏠 Contexte principal' : '📦 Contexte iframe');
+
+	const STORAGE_KEY = 'bombparty_definitions_prefs';
+
+	function savePreferences(prefs) {
+		try {
+			localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+			console.log('💾 Préférences sauvegardées:', prefs);
+		} catch (e) {
+			console.error('❌ Erreur sauvegarde:', e);
+		}
+	}
+
+	function loadPreferences() {
+		try {
+			const saved = localStorage.getItem(STORAGE_KEY);
+			if (saved) {
+				const prefs = JSON.parse(saved);
+				console.log('📂 Préférences chargées:', prefs);
+				return prefs;
+			}
+		} catch (e) {
+			console.error('❌ Erreur chargement:', e);
+		}
+		return {
+			top: 20,
+			left: 20,
+			width: 420,
+			height: 600,
+			minimized: false
+		};
+	}
+
+	let currentWord = '';
+	let typingTimer = null;
+	let lastKeyTime = 0;
+	let keyPressCount = 0;
+	let lastSearchedWord = '';
+	const definitionCache = new Map();
+	let gameInput = null;
+
+	function sendToMainWindow(type, data) {
+		if (!isMainWindow && window.top) {
+			try {
+				window.top.postMessage({
+					source: 'bombparty-definitions',
+					type: type,
+					data: data
+				}, '*');
+			} catch (e) {
+				console.log('⚠️ Erreur envoi message:', e);
+			}
+		}
+	}
+
+	if (isMainWindow) {
+		window.addEventListener('message', (event) => {
+			if (event.data && event.data.source === 'bombparty-definitions') {
+				console.log('📨 Message reçu de iframe:', event.data.type, event.data.data);
+
+				if (event.data.type === 'wordChange') {
+					handleWordChange(event.data.data);
+				} else if (event.data.type === 'wordUpdate') {
+					updateCurrentWord(event.data.data);
+				}
+			}
+		});
+	}
+
+	function findGameInput() {
+		const selectors = [
+			'input.styled[type="text"]',
+			'input[type="text"].styled',
+			'input[type="text"]:not([id*="analyzer"])',
+		];
+
+		for (const selector of selectors) {
+			const inputs = document.querySelectorAll(selector);
+			for (const input of inputs) {
+				if (input.closest('#definition-panel')) continue;
+				if (input.id && input.id.includes('analyzer')) continue;
+
+				const rect = input.getBoundingClientRect();
+				if (rect.width > 0 && rect.height > 0) {
+					console.log('🎯 Input de jeu trouvé:', input, 'Sélecteur:', selector);
+					return input;
+				}
+			}
+		}
+
+		const allTextInputs = document.querySelectorAll('input[type="text"]');
+		for (let i = allTextInputs.length - 1; i >= 0; i--) {
+			const input = allTextInputs[i];
+			if (input.closest('#definition-panel')) continue;
+			if (input.id && input.id.includes('analyzer')) continue;
+
+			const rect = input.getBoundingClientRect();
+			if (rect.width > 0 && rect.height > 0) {
+				console.log('🎯 Input de jeu trouvé (fallback):', input);
+				return input;
+			}
+		}
+
+		return null;
+	}
+
+	function watchGameInput() {
+		const tryAttach = () => {
+			gameInput = findGameInput();
+
+			if (gameInput && !gameInput.dataset.defMonitored) {
+				gameInput.dataset.defMonitored = 'true';
+				console.log('✅ Attachement à l\'input de jeu');
+
+				let lastValue = '';
+				const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+
+				Object.defineProperty(gameInput, 'value', {
+					get: function() {
+						return descriptor.get.call(this);
+					},
+					set: function(newValue) {
+						const oldValue = descriptor.get.call(this);
+						descriptor.set.call(this, newValue);
+
+						if (newValue !== oldValue && newValue !== lastValue) {
+							console.log('📝 Changement value détecté:', newValue);
+							lastValue = newValue;
+							if (isMainWindow) {
+								handleWordChange(newValue);
+							} else {
+								sendToMainWindow('wordChange', newValue);
+							}
+						}
+					},
+					configurable: true
+				});
+
+				setInterval(() => {
+					if (gameInput && document.contains(gameInput)) {
+						const currentValue = descriptor.get.call(gameInput) || '';
+						if (currentValue !== lastValue) {
+							console.log('🔄 Polling détecté:', currentValue);
+							lastValue = currentValue;
+							if (isMainWindow) {
+								handleWordChange(currentValue);
+							} else {
+								sendToMainWindow('wordChange', currentValue);
+							}
+						}
+					}
+				}, 50);
+
+				const events = [
+					'input', 'change', 'keydown', 'keyup', 'keypress',
+					'beforeinput', 'textInput', 'compositionstart',
+					'compositionupdate', 'compositionend', 'paste', 'cut'
+				];
+
+				events.forEach(eventType => {
+					gameInput.addEventListener(eventType, function(e) {
+						const value = descriptor.get.call(this) || '';
+						console.log(`📡 Event ${eventType}:`, value);
+						if (isMainWindow) {
+							handleWordChange(value);
+						} else {
+							sendToMainWindow('wordChange', value);
+						}
+					}, {
+						capture: true,
+						passive: true
+					});
+				});
+
+				const observer = new MutationObserver((mutations) => {
+					const value = descriptor.get.call(gameInput) || '';
+					if (value !== lastValue) {
+						console.log('👁️ Mutation détectée:', value);
+						lastValue = value;
+						if (isMainWindow) {
+							handleWordChange(value);
+						} else {
+							sendToMainWindow('wordChange', value);
+						}
+					}
+				});
+
+				observer.observe(gameInput, {
+					attributes: true,
+					attributeOldValue: true,
+					characterData: true,
+					characterDataOldValue: true,
+					childList: true,
+					subtree: true
+				});
+			}
+		};
+
+		tryAttach();
+
+		const observer = new MutationObserver(() => {
+			if (!gameInput || !document.contains(gameInput)) {
+				tryAttach();
+			}
+		});
+
+		observer.observe(document.documentElement, {
+			childList: true,
+			subtree: true
+		});
+
+		setInterval(tryAttach, 1000);
+	}
+
+	function handleWordChange(value) {
+		const now = Date.now();
+
+		if (now - lastKeyTime > 2000) {
+			currentWord = '';
+		}
+		lastKeyTime = now;
+
+		const cleanValue = (value || '').trim();
+
+		if (cleanValue && cleanValue !== currentWord) {
+			currentWord = cleanValue;
+			keyPressCount++;
+			updateCurrentWord(currentWord);
+
+			console.log('🔤 Mot mis à jour:', currentWord);
+
+			clearTimeout(typingTimer);
+			if (currentWord.length >= 3) {
+				typingTimer = setTimeout(() => {
+					console.log('🔍 Auto-recherche:', currentWord);
+					fetchDefinition(currentWord);
+				}, 300);
+			}
+		} else if (!cleanValue && currentWord) {
+			if (currentWord.length >= 2) {
+				fetchDefinition(currentWord);
+			}
+			currentWord = '';
+			updateCurrentWord('');
+		}
+	}
+
+	function setupGlobalCapture() {
+		['keydown', 'keyup', 'keypress'].forEach(eventType => {
+			window.addEventListener(eventType, function(e) {
+				if (e.target.closest('#definition-panel')) return;
+				if (eventType !== 'keydown') return;
+				if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+				const key = e.key;
+				keyPressCount++;
+
+				console.log('⌨️ Touche globale:', key, '| Target:', e.target.tagName, '| Classes:', e.target.className);
+
+				if (e.target === gameInput) {
+					return;
+				}
+
+				const now = Date.now();
+				if (now - lastKeyTime > 2000) {
+					currentWord = '';
+				}
+				lastKeyTime = now;
+
+				if (key === 'Backspace') {
+					currentWord = currentWord.slice(0, -1);
+					if (isMainWindow) {
+						updateCurrentWord(currentWord);
+					} else {
+						sendToMainWindow('wordUpdate', currentWord);
+					}
+				} else if (key === 'Enter') {
+					if (currentWord.length >= 2) {
+						if (isMainWindow) {
+							fetchDefinition(currentWord);
+						}
+					}
+					setTimeout(() => {
+						currentWord = '';
+						if (isMainWindow) {
+							updateCurrentWord(currentWord);
+						} else {
+							sendToMainWindow('wordUpdate', currentWord);
+						}
+					}, 100);
+				} else if (key === ' ' || key === 'Escape') {
+					if (currentWord.length >= 2) {
+						if (isMainWindow) {
+							fetchDefinition(currentWord);
+						}
+					}
+					currentWord = '';
+					if (isMainWindow) {
+						updateCurrentWord(currentWord);
+					} else {
+						sendToMainWindow('wordUpdate', currentWord);
+					}
+				} else if (key.length === 1 && /[a-zà-ÿA-ZÀ-Ÿ]/.test(key)) {
+					currentWord += key;
+					if (isMainWindow) {
+						updateCurrentWord(currentWord);
+					} else {
+						sendToMainWindow('wordUpdate', currentWord);
+					}
+
+					clearTimeout(typingTimer);
+					if (currentWord.length >= 3) {
+						typingTimer = setTimeout(() => {
+							if (isMainWindow) {
+								fetchDefinition(currentWord);
+							}
+						}, 300);
+					}
+				}
+			}, true);
+		});
+	}
+	function createUI() {
+		if (document.getElementById('definition-panel')) {
+			console.log('⚠️ Panneau UI déjà existant, arrêt');
+			return;
+		}
+
+		const prefs = loadPreferences();
+
+		const style = document.createElement('style');
+		style.textContent = `
+            @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap');
+
+            #definition-panel {
+                position: fixed;
+                background: #000000;
+                border: 2px solid #1a1a1a;
+                box-shadow:
+                    0 0 40px rgba(255, 255, 255, 0.03),
+                    inset 0 0 20px rgba(255, 255, 255, 0.02),
+                    0 20px 60px rgba(0, 0, 0, 0.9);
+                font-family: 'Orbitron', -apple-system, sans-serif;
+                color: #ffffff;
+                z-index: 999999;
+                overflow: hidden;
+                transition: none;
+                resize: both;
+                min-width: 300px;
+                min-height: 200px;
+                max-width: 90vw;
+                max-height: 90vh;
+            }
+
+            #definition-panel.resizing {
+                transition: none !important;
+            }
+
+            .def-header {
+                background: linear-gradient(180deg, #0a0a0a 0%, #000000 100%);
+                padding: 0;
+                border-bottom: 1px solid #1a1a1a;
+                position: relative;
+            }
+
+            .def-header::after {
+                content: '';
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                height: 1px;
+                background: linear-gradient(90deg,
+                    transparent 0%,
+                    rgba(255, 255, 255, 0.1) 50%,
+                    transparent 100%);
+            }
+
+            .def-title-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 12px 16px;
+                cursor: move;
+                user-select: none;
+            }
+
+            .def-title {
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 3px;
+                text-transform: uppercase;
+                color: #666;
+            }
+
+            .def-controls {
+                display: flex;
+                gap: 8px;
+            }
+
+            .def-btn {
+                width: 20px;
+                height: 20px;
+                background: transparent;
+                border: 1px solid #222;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #666;
+                font-size: 14px;
+                transition: all 0.2s;
+                padding: 0;
+            }
+
+            .def-btn:hover {
+                background: #0a0a0a;
+                border-color: #333;
+                color: #fff;
+            }
+
+            .def-current-word-bar {
+                padding: 16px 20px;
+                background: #000000;
+                border-bottom: 1px solid #0a0a0a;
+                min-height: 60px;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+            }
+
+            .def-current-label {
+                font-size: 9px;
+                font-weight: 700;
+                letter-spacing: 2px;
+                text-transform: uppercase;
+                color: #444;
+                margin-bottom: 8px;
+            }
+
+            .def-current-word {
+                font-size: 28px;
+                font-weight: 900;
+                letter-spacing: 2px;
+                color: #ffffff;
+                text-transform: uppercase;
+                text-shadow: 0 0 20px rgba(255, 255, 255, 0.3);
+                animation: glow 2s ease-in-out infinite;
+            }
+
+            @keyframes glow {
+                0%, 100% { text-shadow: 0 0 20px rgba(255, 255, 255, 0.3); }
+                50% { text-shadow: 0 0 30px rgba(255, 255, 255, 0.5); }
+            }
+
+            .def-current-word.empty {
+                color: #333;
+                text-shadow: none;
+                font-size: 14px;
+                font-weight: 400;
+                letter-spacing: 1px;
+                text-transform: none;
+            }
+
+            .def-content {
+                padding: 20px;
+                overflow-y: auto;
+                background: #000000;
+                height: calc(100% - 180px);
+            }
+
+            .def-content::-webkit-scrollbar {
+                width: 4px;
+            }
+
+            .def-content::-webkit-scrollbar-track {
+                background: #000000;
+            }
+
+            .def-content::-webkit-scrollbar-thumb {
+                background: #1a1a1a;
+            }
+
+            .def-content::-webkit-scrollbar-thumb:hover {
+                background: #2a2a2a;
+            }
+
+            .def-word-header {
+                margin-bottom: 20px;
+                padding-bottom: 15px;
+                border-bottom: 1px solid #0a0a0a;
+            }
+
+            .def-source {
+                font-size: 9px;
+                color: #444;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 2px;
+                display: inline-block;
+                padding: 6px 12px;
+                background: #0a0a0a;
+                border: 1px solid #1a1a1a;
+            }
+
+            .def-phonetic {
+                font-size: 13px;
+                color: #555;
+                margin-top: 12px;
+                font-weight: 400;
+                letter-spacing: 1px;
+            }
+
+            .def-meaning {
+                margin-bottom: 24px;
+                padding: 16px;
+                background: #0a0a0a;
+                border: 1px solid #1a1a1a;
+                position: relative;
+            }
+
+            .def-meaning::before {
+                content: '';
+                position: absolute;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                width: 2px;
+                background: #222;
+            }
+
+            .def-pos {
+                font-size: 10px;
+                color: #666;
+                font-weight: 700;
+                margin-bottom: 14px;
+                text-transform: uppercase;
+                letter-spacing: 2px;
+            }
+
+            .def-definition {
+                font-size: 14px;
+                line-height: 1.8;
+                color: #ccc;
+                margin-bottom: 12px;
+                font-weight: 400;
+                letter-spacing: 0.3px;
+            }
+
+            .def-definition::before {
+                content: '▸';
+                margin-right: 10px;
+                color: #333;
+                font-weight: bold;
+            }
+
+            .def-example {
+                font-size: 12px;
+                color: #666;
+                font-style: italic;
+                margin-left: 20px;
+                margin-top: 10px;
+                padding: 10px 14px;
+                background: #000000;
+                border-left: 2px solid #1a1a1a;
+                font-weight: 300;
+            }
+
+            .def-loading {
+                text-align: center;
+                padding: 40px 20px;
+                color: #444;
+                font-size: 12px;
+                letter-spacing: 2px;
+                text-transform: uppercase;
+            }
+
+            .def-loading::before {
+                content: '';
+                display: block;
+                width: 40px;
+                height: 40px;
+                margin: 0 auto 20px;
+                border: 2px solid #1a1a1a;
+                border-top-color: #333;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+            }
+
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+
+            .def-error {
+                text-align: center;
+                padding: 30px 20px;
+                color: #444;
+                font-size: 11px;
+                letter-spacing: 1px;
+                text-transform: uppercase;
+            }
+
+            .def-empty {
+                text-align: center;
+                padding: 40px 20px;
+                color: #333;
+                font-size: 11px;
+                letter-spacing: 2px;
+                text-transform: uppercase;
+            }
+
+            #definition-panel.minimized {
+                height: 45px !important;
+                resize: none;
+            }
+
+            #definition-panel.minimized .def-current-word-bar,
+            #definition-panel.minimized .def-content {
+                display: none;
+            }
+
+            @keyframes fadeIn {
+                from {
+                    opacity: 0;
+                    transform: translateY(-10px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+
+            #definition-panel {
+                animation: fadeIn 0.5s ease-out;
+            }
+
+            .def-debug {
+                font-size: 9px;
+                color: #333;
+                text-align: center;
+                padding: 8px;
+                border-top: 1px solid #0a0a0a;
+            }
+
+            .def-status {
+                display: inline-block;
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: #0f0;
+                margin-right: 6px;
+                animation: pulse 2s infinite;
+            }
+
+            @keyframes pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.3; }
+            }
+
+            .def-resize-handle {
+                position: absolute;
+                bottom: 0;
+                right: 0;
+                width: 20px;
+                height: 20px;
+                cursor: nwse-resize;
+                opacity: 0.3;
+                transition: opacity 0.2s;
+            }
+
+            .def-resize-handle:hover {
+                opacity: 0.8;
+            }
+
+            .def-resize-handle::before {
+                content: '';
+                position: absolute;
+                bottom: 2px;
+                right: 2px;
+                width: 0;
+                height: 0;
+                border-style: solid;
+                border-width: 0 0 12px 12px;
+                border-color: transparent transparent #333 transparent;
+            }
+        `;
+		document.head.appendChild(style);
+
+		const panel = document.createElement('div');
+		panel.id = 'definition-panel';
+		panel.style.top = prefs.top + 'px';
+		panel.style.left = prefs.left + 'px';
+		panel.style.width = prefs.width + 'px';
+		panel.style.height = prefs.height + 'px';
+
+		if (prefs.minimized) {
+			panel.classList.add('minimized');
+		}
+
+		panel.innerHTML = `
+            <div class="def-header">
+                <div class="def-title-bar">
+                    <div class="def-title"><span class="def-status"></span>DEF FINDER</div>
+                    <div class="def-controls">
+                        <button class="def-btn" id="toggle-def">${prefs.minimized ? '+' : '−'}</button>
+                    </div>
+                </div>
+                <div class="def-current-word-bar">
+                    <div class="def-current-label">Mot actuel</div>
+                    <div class="def-current-word empty">En attente...</div>
+                </div>
+            </div>
+            <div class="def-content">
+                <div class="def-empty">Commencez à taper pour voir les définitions</div>
+            </div>
+            <div class="def-debug">🟢 Multi-Frame Monitor | 0 touches</div>
+            <div class="def-resize-handle"></div>
+        `;
+		document.body.appendChild(panel);
+
+		setupDragging(panel);
+		setupToggle(panel);
+		setupResizing(panel);
+		setupAutoSave(panel);
+	}
+
+	function setupDragging(panel) {
+		let isDragging = false;
+		let currentX, currentY, initialX, initialY;
+		const titleBar = panel.querySelector('.def-title-bar');
+
+		titleBar.addEventListener('mousedown', (e) => {
+			if (e.target.closest('.def-btn')) return;
+			isDragging = true;
+			initialX = e.clientX - panel.offsetLeft;
+			initialY = e.clientY - panel.offsetTop;
+			panel.style.transition = 'none';
+		});
+
+		document.addEventListener('mousemove', (e) => {
+			if (isDragging) {
+				e.preventDefault();
+				currentX = e.clientX - initialX;
+				currentY = e.clientY - initialY;
+
+				// Limites d'écran
+				currentX = Math.max(0, Math.min(currentX, window.innerWidth - 100));
+				currentY = Math.max(0, Math.min(currentY, window.innerHeight - 50));
+
+				panel.style.left = currentX + 'px';
+				panel.style.top = currentY + 'px';
+			}
+		});
+
+		document.addEventListener('mouseup', () => {
+			if (isDragging) {
+				isDragging = false;
+				const prefs = loadPreferences();
+				prefs.top = parseInt(panel.style.top);
+				prefs.left = parseInt(panel.style.left);
+				savePreferences(prefs);
+			}
+		});
+	}
+
+	function setupToggle(panel) {
+		let isMinimized = loadPreferences().minimized;
+
+		document.getElementById('toggle-def').addEventListener('click', () => {
+			isMinimized = !isMinimized;
+			panel.classList.toggle('minimized');
+			document.getElementById('toggle-def').textContent = isMinimized ? '+' : '−';
+			const prefs = loadPreferences();
+			prefs.minimized = isMinimized;
+			savePreferences(prefs);
+		});
+	}
+
+	function setupResizing(panel) {
+		const resizeHandle = panel.querySelector('.def-resize-handle');
+		let isResizing = false;
+		let startX, startY, startWidth, startHeight;
+
+		resizeHandle.addEventListener('mousedown', (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			isResizing = true;
+			startX = e.clientX;
+			startY = e.clientY;
+			startWidth = parseInt(getComputedStyle(panel).width);
+			startHeight = parseInt(getComputedStyle(panel).height);
+			panel.classList.add('resizing');
+		});
+
+		document.addEventListener('mousemove', (e) => {
+			if (isResizing) {
+				e.preventDefault();
+				const width = startWidth + (e.clientX - startX);
+				const height = startHeight + (e.clientY - startY);
+				panel.style.width = Math.max(300, Math.min(width, window.innerWidth * 0.9)) + 'px';
+				panel.style.height = Math.max(200, Math.min(height, window.innerHeight * 0.9)) + 'px';
+			}
+		});
+
+		document.addEventListener('mouseup', () => {
+			if (isResizing) {
+				isResizing = false;
+				panel.classList.remove('resizing');
+				const prefs = loadPreferences();
+				prefs.width = parseInt(panel.style.width);
+				prefs.height = parseInt(panel.style.height);
+				savePreferences(prefs);
+			}
+		});
+	}
+
+	function setupAutoSave(panel) {
+		const resizeObserver = new ResizeObserver((entries) => {
+			for (const entry of entries) {
+				if (!entry.target.classList.contains('resizing')) {
+					clearTimeout(resizeObserver.saveTimeout);
+					resizeObserver.saveTimeout = setTimeout(() => {
+						const prefs = loadPreferences();
+						prefs.width = parseInt(panel.style.width) || prefs.width;
+						prefs.height = parseInt(panel.style.height) || prefs.height;
+						savePreferences(prefs);
+					}, 500);
+				}
+			}
+		});
+
+		resizeObserver.observe(panel);
+	}
+
+	function updateCurrentWord(word) {
+		const panel = document.getElementById('definition-panel');
+		if (!panel) return;
+
+		const wordElement = panel.querySelector('.def-current-word');
+		const debugElement = panel.querySelector('.def-debug');
+
+		if (word) {
+			wordElement.textContent = word.toUpperCase();
+			wordElement.classList.remove('empty');
+			debugElement.innerHTML = `🟢 Monitor Active | ${word.length} lettres | ${keyPressCount} touches`;
+		} else {
+			wordElement.textContent = 'En attente...';
+			wordElement.classList.add('empty');
+			debugElement.innerHTML = `🟢 Multi-Frame Monitor | ${keyPressCount} touches`;
+		}
+	}
+
+	function normalizeWord(word) {
+		return word
+			.toLowerCase()
+			.normalize('NFD')
+			.replace(/[\u0300-\u036f]/g, '')
+			.trim();
+	}
+
+	function generateAccentVariants(word) {
+		const normalized = normalizeWord(word);
+		const variants = new Set([word.toLowerCase(), normalized]);
+
+		const accentMap = {
+			'e': ['e', 'é', 'è', 'ê', 'ë'],
+			'a': ['a', 'à', 'â', 'ä'],
+			'i': ['i', 'î', 'ï'],
+			'o': ['o', 'ô', 'ö'],
+			'u': ['u', 'ù', 'û', 'ü'],
+			'c': ['c', 'ç'],
+			'y': ['y', 'ÿ']
+		};
+		function generateVariantsRecursive(str, index = 0) {
+			if (index >= str.length) return [str];
+			const char = str[index];
+			const results = [];
+
+			if (accentMap[char]) {
+				for (const replacement of accentMap[char]) {
+					const newStr = str.substring(0, index) + replacement + str.substring(index + 1);
+					results.push(...generateVariantsRecursive(newStr, index + 1));
+				}
+			} else {
+				results.push(...generateVariantsRecursive(str, index + 1));
+			}
+			return results;
+		}
+
+		if (normalized.length < 15) {
+			const generated = generateVariantsRecursive(normalized);
+			generated.slice(0, 50).forEach(v => variants.add(v));
+		} else {
+			const commonVariants = normalized.replace(/e/g, 'é').replace(/a/g, 'à');
+			variants.add(commonVariants);
+		}
+
+		return Array.from(variants);
+	}
+	class DefinitionSources {
+		static async fetchWiktionary(word) {
+			return new Promise((resolve, reject) => {
+				GM_xmlhttpRequest({
+					method: 'GET',
+					url: `https://fr.wiktionary.org/api/rest_v1/page/definition/${encodeURIComponent(word)}`,
+					timeout: 2000,
+					onload: function(response) {
+						try {
+							const data = JSON.parse(response.responseText);
+							if (data && data.fr && data.fr.length > 0) {
+								const result = {
+									word: word,
+									source: 'Wiktionnaire',
+									meanings: []
+								};
+
+								data.fr.forEach(entry => {
+									if (entry.definitions && entry.definitions.length > 0) {
+										const meaning = {
+											partOfSpeech: entry.partOfSpeech || 'Définition',
+											definitions: entry.definitions.slice(0, 3).map(def => ({
+												definition: def.definition.replace(/<[^>]*>/g, '').trim(),
+												examples: def.examples ? def.examples.slice(0, 1).map(ex => ex.replace(/<[^>]*>/g, '').trim()) : []
+											}))
+										};
+										result.meanings.push(meaning);
+									}
+								});
+
+								if (result.meanings.length > 0) {
+									resolve(result);
+								} else {
+									reject('Pas de définitions');
+								}
+							} else {
+								reject('Mot non trouvé');
+							}
+						} catch (e) {
+							reject(e);
+						}
+					},
+					onerror: reject,
+					ontimeout: reject
+				});
+			});
+		}
+
+		static async fetchWiktionaryHTML(word) {
+			return new Promise((resolve, reject) => {
+				GM_xmlhttpRequest({
+					method: 'GET',
+					url: `https://fr.wiktionary.org/wiki/${encodeURIComponent(word)}`,
+					timeout: 3000,
+					onload: function(response) {
+						try {
+							const html = response.responseText;
+
+							if (html.includes('Wiktionnaire ne possède pas d\'article') ||
+								html.includes('Cette page n\'existe pas')) {
+								reject('Page non trouvée');
+								return;
+							}
+
+							const parser = new DOMParser();
+							const doc = parser.parseFromString(html, 'text/html');
+							const definitions = [];
+							const defLists = doc.querySelectorAll('ol');
+
+							defLists.forEach(ol => {
+								const items = ol.querySelectorAll('li');
+								items.forEach((li, index) => {
+									if (definitions.length < 3 && index < 3) {
+										const text = li.textContent.trim();
+										const cleanText = text
+											.split('\n')[0]
+											.replace(/\[.*?\]/g, '')
+											.replace(/\(.*?\)/g, '')
+											.trim();
+
+										if (cleanText && cleanText.length > 10 && !cleanText.startsWith('(')) {
+											definitions.push({
+												definition: cleanText,
+												examples: []
+											});
+										}
+									}
+								});
+							});
+
+							if (definitions.length > 0) {
+								resolve({
+									word: word,
+									source: 'Wiktionnaire',
+									meanings: [{
+										partOfSpeech: 'Définition',
+										definitions: definitions
+									}]
+								});
+							} else {
+								reject('Aucune définition trouvée');
+							}
+						} catch (e) {
+							reject(e);
+						}
+					},
+					onerror: reject,
+					ontimeout: reject
+				});
+			});
+		}
+
+		static async fetchDictionaryAPI(word) {
+			return new Promise((resolve, reject) => {
+				GM_xmlhttpRequest({
+					method: 'GET',
+					url: `https://api.dictionaryapi.dev/api/v2/entries/fr/${encodeURIComponent(word)}`,
+					timeout: 2000,
+					onload: function(response) {
+						try {
+							const data = JSON.parse(response.responseText);
+							if (data && data.length > 0 && !data.title) {
+								const entry = data[0];
+								resolve({
+									word: entry.word,
+									source: 'DictionaryAPI',
+									phonetic: entry.phonetic,
+									meanings: entry.meanings.slice(0, 3).map(m => ({
+										partOfSpeech: m.partOfSpeech,
+										definitions: m.definitions.slice(0, 2).map(d => ({
+											definition: d.definition,
+											examples: d.example ? [d.example] : []
+										}))
+									}))
+								});
+							} else {
+								reject('Mot non trouvé');
+							}
+						} catch (e) {
+							reject(e);
+						}
+					},
+					onerror: reject,
+					ontimeout: reject
+				});
+			});
+		}
+	}
+
+	async function fetchDefinition(word) {
+		const cleanWord = word.toLowerCase().trim();
+		if (!cleanWord || cleanWord.length < 2) return;
+
+		const normalizedWord = normalizeWord(cleanWord);
+		if (definitionCache.has(normalizedWord)) {
+			displayDefinition(definitionCache.get(normalizedWord));
+			return;
+		}
+
+		if (lastSearchedWord === normalizedWord) return;
+		lastSearchedWord = normalizedWord;
+
+		const panel = document.getElementById('definition-panel');
+		if (!panel) return;
+
+		const content = panel.querySelector('.def-content');
+		content.innerHTML = '<div class="def-loading">Recherche rapide...</div>';
+		console.log('⚡ Recherche ultra-rapide:', cleanWord);
+		const variants = generateAccentVariants(cleanWord);
+		console.log('📝 Variantes:', variants.slice(0, 3), `... (${variants.length} total)`);
+		const topVariants = variants.slice(0, 3);
+		const allPromises = [];
+
+		for (const variant of topVariants) {
+			allPromises.push(
+				DefinitionSources.fetchWiktionary(variant)
+				.then(result => ({
+					result,
+					variant,
+					source: 'Wiktionary'
+				}))
+				.catch(() => null)
+			);
+			allPromises.push(
+				DefinitionSources.fetchDictionaryAPI(variant)
+				.then(result => ({
+					result,
+					variant,
+					source: 'DictionaryAPI'
+				}))
+				.catch(() => null)
+			);
+			if (topVariants.indexOf(variant) === 0) {
+				allPromises.push(
+					DefinitionSources.fetchWiktionaryHTML(variant)
+					.then(result => ({
+						result,
+						variant,
+						source: 'WiktionaryHTML'
+					}))
+					.catch(() => null)
+				);
+			}
+		}
+
+		try {
+			const winner = await Promise.race(
+				allPromises.map(p => p.then(r => r || Promise.reject()))
+			);
+
+			if (winner && winner.result) {
+				definitionCache.set(normalizedWord, winner.result);
+				displayDefinition(winner.result);
+				console.log('⚡ Trouvé instantanément:', winner.variant, 'via', winner.source);
+				return;
+			}
+		} catch (e) {
+			const results = await Promise.allSettled(allPromises);
+
+			for (const result of results) {
+				if (result.status === 'fulfilled' && result.value && result.value.result) {
+					definitionCache.set(normalizedWord, result.value.result);
+					displayDefinition(result.value.result);
+					console.log('✅ Trouvé:', result.value.variant);
+					return;
+				}
+			}
+		}
+		if (variants.length > 3) {
+			console.log('🔄 Recherche étendue sur les autres variantes...');
+			const remainingVariants = variants.slice(3, 8);
+
+			for (const variant of remainingVariants) {
+				try {
+					const result = await DefinitionSources.fetchWiktionary(variant);
+					definitionCache.set(normalizedWord, result);
+					displayDefinition(result);
+					console.log('✅ Trouvé (fallback):', variant);
+					return;
+				} catch (e) {
+
+				}
+			}
+		}
+
+		console.log('❌ Non trouvé');
+		content.innerHTML = `<div class="def-error">Aucune définition trouvée</div>`;
+	}
+
+	function displayDefinition(data) {
+		const panel = document.getElementById('definition-panel');
+		if (!panel) return;
+
+		const content = panel.querySelector('.def-content');
+
+		if (!data || !data.meanings || data.meanings.length === 0) {
+			content.innerHTML = '<div class="def-error">Aucune définition trouvée</div>';
+			return;
+		}
+
+		let html = `
+            <div class="def-word-header">
+                <span class="def-source">${data.source}</span>
+                ${data.phonetic ? `<div class="def-phonetic">${data.phonetic}</div>` : ''}
+            </div>
+        `;
+
+		data.meanings.forEach(meaning => {
+			html += `<div class="def-meaning">`;
+			html += `<div class="def-pos">${meaning.partOfSpeech}</div>`;
+
+			meaning.definitions.forEach(def => {
+				html += `<div class="def-definition">${def.definition}</div>`;
+				if (def.examples && def.examples.length > 0) {
+					def.examples.forEach(ex => {
+						html += `<div class="def-example">${ex}</div>`;
+					});
+				}
+			});
+
+			html += `</div>`;
+		});
+
+		content.innerHTML = html;
+	}
+	function init() {
+		console.log('🚀 BombParty Définitions DEF FINDER');
+		console.log('🎯 Contexte:', isMainWindow ? 'Principal (UI activée)' : 'Iframe (capture seule)');
+		console.log('💾 Système de sauvegarde: Activé');
+		console.log('📐 Redimensionnement: Activé');
+		console.log('⚡ Recherche parallèle: Activée (2x-3x plus rapide)');
+
+		if (document.readyState === 'loading') {
+			document.addEventListener('DOMContentLoaded', () => {
+				if (isMainWindow) {
+					createUI();
+				}
+				watchGameInput();
+				setupGlobalCapture();
+			});
+		} else {
+			if (isMainWindow) {
+				createUI();
+			}
+			watchGameInput();
+			setupGlobalCapture();
+		}
+	}
+
+	init();
+
+})();
